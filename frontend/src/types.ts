@@ -95,7 +95,7 @@ export type DetectedBrowser = {
 /// share names but the schema enum carries extra archive-only variants).
 /// Mirrors `src/config/platform.rs::Platform` (`#[derive(Serialize)]` →
 /// PascalCase JSON: `"Majsoul"`, `"Tenhou"`).
-export type PlatformKind = 'Majsoul' | 'Tenhou'
+export type PlatformKind = 'Majsoul' | 'Tenhou' | 'RiichiCity'
 
 export type MajsoulAutoplayConfig = {
   pre_click_delay_min_ms: number
@@ -103,22 +103,255 @@ export type MajsoulAutoplayConfig = {
   inter_click_delay_ms: number
   hover_delay_ms: number
   click_hold_ms: number
+  /** Wait this long for the client's own input command after a click
+   *  before pressing again; 0 disables verification. */
+  verify_input_ms: number
+  /** Retries when no input command follows a click sequence; 0 = log only. */
+  click_retries: number
+  /** Reload the game page after this many dead decisions in a row; 0 = off. */
+  reload_after_failures: number
   dealer_first_discard_extra_delay_ms: number
+}
+
+/** Pre-click delay model parameters. Mirrors
+ *  `src/config/autoplay.rs::DelayModelConfig`; the fine-grained knobs are
+ *  config-file-only — the Settings UI exposes the Lua script fields. */
+export type DelayMode = 'legacy' | 'lua'
+
+export type DelayModelConfig = {
+  /** Which policy is active; exactly one. `legacy` = the old fixed
+   *  uniform model, `lua` = the scriptable human-like model backed by
+   *  `delay.lua` next to the config file (auto-generated). */
+  mode: DelayMode
+  /** UI-readiness floor: minimum total thinking time per decision, ms.
+   *  Clicks issued before Mahjong Soul renders the UI are lost. */
+  min_delay_ms: number
+  /** Higher floor for decisions that click an action button (chi/pon/
+   *  kan/ron/skip/riichi) — buttons render after the discard animation
+   *  plus their own pop-in, later than hand tiles. */
+  min_button_delay_ms: number
+  distribution: 'uniform' | 'log_normal'
+  /** Per-decision-kind log-normal `[mu, sigma]` in ln(seconds); keys like
+   *  `dahai_tedashi`, `claim`. Calibrated from ranked-game records. */
+  lognormal: Record<string, [number, number]>
+  bank_on_long_thought: boolean
+  riichi_extra_ms: number
+  kan_extra_ms: number
+  safety_margin_ms: number
+  bank_use_fraction: number
+  bank_max_single_ms: number
+  no_budget_cap_ms: number
 }
 
 export type AutoplayConfig = {
   enabled: boolean
   majsoul: MajsoulAutoplayConfig
+  delay: DelayModelConfig
 }
 
+/** Optional cloud-inference settings for the built-in native bot.
+ *  Mirrors `crate::config::NativeApiConfig`. */
+export type NativeApiConfig = {
+  enabled: boolean
+  base_url: string
+  key: string
+  model_4p: string
+  model_3p: string
+  /** Whether `proxy` is applied. Off ⇒ direct even if `proxy` holds a value. */
+  proxy_enabled: boolean
+  /** Proxy for all inference-server traffic: http://, https://, socks5:// or
+   *  socks5h:// URL. Applied only when `proxy_enabled`; empty = direct. */
+  proxy: string
+  /** Per-decision timeout for POST /v3/react, in milliseconds. Clamped to
+   *  500–10000ms on the backend before use. Default 3000. */
+  react_timeout_ms: number
+}
+
+/** The always-on-top suggestion overlay. Mirrors `crate::config::OverlayConfig`. */
+export type OverlayConfig = {
+  enabled: boolean
+  top_n: number
+  opacity: number
+  always_on_top: boolean
+}
+
+/** How GitHub-hosted downloads are routed. Mirrors
+ *  `crate::config::GithubMirrorMode` (serde snake_case). */
+export type GithubMirrorMode = 'auto' | 'direct' | 'mirror'
+
+/** `[network]` section. Mirrors `crate::config::NetworkConfig`. */
+export type NetworkConfig = {
+  github_mirror_mode: GithubMirrorMode
+  /** gh-proxy-style accelerator prefix (e.g. `https://gh-proxy.com`);
+   *  tried before the built-in mirror list. Empty = unset. */
+  github_custom_mirror: string
+}
+
+/** Bounds enforced by `crate::config::overlay` — mirrored so the UI can't
+ *  offer a value the backend would silently clamp. */
+export const OVERLAY_TOP_N_MIN = 1
+export const OVERLAY_TOP_N_MAX = 5
+export const OVERLAY_OPACITY_MIN = 0.3
+export const OVERLAY_OPACITY_MAX = 1.0
+
 export type AppConfig = {
-  general: { language: string; first_run_completed: boolean }
+  general: { first_run_completed: boolean; developer_mode: boolean }
   logging: { dir: string; level: string; all_level: string }
   platform: { kind: PlatformKind }
-  proxy: { enabled: boolean; addr: string; ca_dir: string }
-  bot: { enabled: boolean; active_4p: string; active_3p: string; auto_sync: boolean; dir: string }
+  proxy: { enabled: boolean; addr: string; ca_dir: string; block_telemetry: boolean }
+  bot: {
+    enabled: boolean
+    active_4p: string
+    active_3p: string
+    auto_sync: boolean
+    dir: string
+    api: NativeApiConfig
+  }
   capture: CaptureConfig
   autoplay: AutoplayConfig
+  overlay: OverlayConfig
+  network: NetworkConfig
+}
+
+// ---------- Built-in bot cloud inference (native API) ----------
+// Mirror the response shapes from `crate::bot::api`.
+
+/** `GET /v3/key` — a key's plan, expiry and live limits. */
+export type KeyStatus = {
+  plan: string
+  expires_at: string
+  usage_today: number
+  rpd: number
+  rpm: number
+  topk: number
+  /** Whole-game reviews submitted today (own meter, resets at UTC midnight). */
+  reviews_today: number
+  /** Review jobs the plan allows per day. 0 ⇒ no review access. */
+  reviews_per_day: number
+}
+
+/** One model a key's plan may use (`GET /v3/models`). */
+export type ModelInfo = { id: string; game: string; desc: string }
+
+/** `POST /v3/redeem` result. `key` is present only when a new key is minted. */
+export type RedeemResponse = {
+  key?: string | null
+  key_last4: string
+  plan: string
+  expires_at: string
+  extended: boolean
+}
+
+/**
+ * `GET /healthz` — liveness + aggregate load. Nothing about the model
+ * registry is exposed here (models come from the authenticated `/v3/models`);
+ * `status` is `"degraded"` when any model worker is down.
+ */
+export type ApiHealth = {
+  status: string
+  /** Total pending + in-flight inference rows. */
+  queue_depth: number
+  workers_alive: boolean
+}
+
+// ---------- Whole-game review (native API) ----------
+// Mirror the response shapes from `crate::bot::api`.
+
+/** `POST /v3/review` — the queued background job. */
+export type ReviewSubmitted = {
+  review_id: string
+  status: string
+}
+
+/** `GET /v3/review/{id}` — job progress. Meta-only: a `done` job carries the
+ *  share URL, and the result body is only ever served through that URL. */
+export type ReviewJobStatus = {
+  status: 'queued' | 'running' | 'failed' | 'done' | string
+  progress?: number | null
+  error?: string | null
+  /** Null after a revoke — re-issue via `native_api_review_share`. */
+  share_id?: string | null
+  url?: string | null
+}
+
+/** `POST /v3/review/{id}/share` — the review's public link. */
+export type ShareIssued = {
+  share_id: string
+  url: string
+  created_at: string
+  anonymized: boolean
+}
+
+/** Aggregate result numbers carried by the share listing. */
+export type ShareSummary = {
+  n_decisions: number
+  n_match: number
+  match_rate: number
+  avg_actual_prob: number
+}
+
+/** One live share link from `GET /v3/shares` (newest first). */
+export type ShareEntry = {
+  share_id: string
+  /** The review job this share serves — joins a listing row back to a submit. */
+  review_id: string
+  /** The review's submit time (RFC 3339). */
+  created_at: string
+  anonymized: boolean
+  model?: string | null
+  player_id?: number | null
+  summary?: ShareSummary | null
+}
+
+// ---------- Self-serve key purchase (PayPal) ----------
+// Mirror the response shapes from `crate::bot::purchase`.
+
+/** `POST /paypal/create-order` — a pending one-time purchase. */
+export type CreatedOrder = {
+  order_id: string
+  approve_url: string
+  claim_secret: string
+}
+
+/** `POST /paypal/create-subscription` — a pending subscription. */
+export type CreatedSubscription = {
+  subscription_id: string
+  approve_url: string
+  claim_secret: string
+}
+
+/**
+ * `POST /creem/create-checkout` — a pending Creem checkout. One create
+ * endpoint serves both one-time and subscription products; the poll
+ * (`POST /creem/result`) reuses the `OrderResult` shape for both kinds
+ * (a subscription resolves to `key` with `days: 0`).
+ */
+export type CreatedCheckout = {
+  checkout_id: string
+  checkout_url: string
+  claim_secret: string
+}
+
+/**
+ * One poll of `POST /paypal/order-result`. On `status: ready` exactly one of
+ * `key` / `code` is set: `key` when the order was created with `redeem: true`
+ * (the server already spent the code), `code` otherwise. Branch on whichever
+ * is present — never re-redeem a code that came back alongside a key.
+ */
+export type OrderResult = {
+  status: string
+  code?: string | null
+  key?: string | null
+  plan?: string | null
+  days?: number | null
+}
+
+/** One poll of `POST /paypal/subscription-result`. `key` only on `ready`. */
+export type SubscriptionResult = {
+  status: string
+  key?: string | null
+  plan?: string | null
+  next_billing?: string | null
 }
 
 export type FieldKind = 'string' | 'bool' | 'int' | 'float' | 'enum'
@@ -221,7 +454,14 @@ export type AnalysisResult = {
   best_defence_discard: string | null
 }
 
-export type DiscardEntry = { tile: string; tedashi: boolean; is_riichi: boolean }
+export type DiscardEntry = {
+  tile: string
+  tedashi: boolean
+  is_riichi: boolean
+  /** Claimed by another player (pon/chi/kan); kept for analysis, hidden in the
+   * rendered river. */
+  called?: boolean
+}
 
 export type MeldSnapshot = {
   kind: 'chi' | 'pon' | 'daiminkan' | 'ankan' | 'kakan'
@@ -349,6 +589,45 @@ export type GameStats = {
   nagashi_mangan: number
 }
 
+/**
+ * Platform-specific match identity captured at `start_game` — which room /
+ * rank lobby the game was played in plus the platform's own game (paifu) id.
+ * Mirrors `crate::schema::history::MatchInfo`: internally tagged on
+ * `platform`, raw platform values, `None` fields omitted from the JSON.
+ */
+export type MatchInfo =
+  | {
+      platform: 'majsoul'
+      /** Raw `game_uuid` — the replay identifier. */
+      game_uuid?: string | null
+      /** Ranked matchmode id (1..=28 = Bronze..Throne / Melee, 4p+3p). */
+      mode_id?: number | null
+      /** Friendly/AI room number. */
+      room_id?: number | null
+      /** Tournament id. */
+      contest_uid?: number | null
+    }
+  | {
+      platform: 'tenhou'
+      /** Paifu id from `<TAIKYOKU log=…>`. */
+      log_id?: string | null
+      /** Raw `<GO type=…>` rule/room bitfield (tier in bits 0x20/0x80). */
+      go_type?: number | null
+      /** Lobby number; 0 = the public ranked lobby. */
+      lobby?: number | null
+    }
+  | {
+      platform: 'riichi_city'
+      /** Table-instance token from the `cmd_enter_room` wrapper. */
+      room_id?: string | null
+      /** Matchmaking classification id (wire string). */
+      classify_id?: string | null
+      /** Rank stage tier of the matchmaking room. */
+      stage_type?: number | null
+      /** Game mode id (e.g. 1001). */
+      game_play?: number | null
+    }
+
 export type GameRecord = {
   id: string
   /** RFC3339 timestamp. */
@@ -366,6 +645,8 @@ export type GameRecord = {
   /** `final_score - starting_score` (4p:25000, 3p:35000). */
   our_delta: number | null
   stats: GameStats
+  /** Absent/null on records from before this field existed. */
+  match_info?: MatchInfo | null
   log_path: string
 }
 
@@ -456,6 +737,35 @@ export type BotReactionPayload = {
   reaction_ms: number
 }
 
+/** Which capture backend observed an event. */
+export type CaptureSource = 'mitm' | 'chromium'
+
+export type HttpPhase = 'request' | 'response'
+
+export type HttpHeader = {
+  name: string
+  value: string
+}
+
+/** A body we kept, or the reason we did not. */
+export type HttpBody = {
+  text?: string
+  bytes?: number
+  /** Absent when the body was captured whole. */
+  skipped?: string
+}
+
+/**
+ * A recognizer's reading of an exchange. Vendor-specific vocabulary lives
+ * in `data` — never in the exchange itself — so a new recognizer needs no
+ * change here.
+ */
+export type HttpAnnotation = {
+  kind: string
+  summary: string
+  data: unknown
+}
+
 export type InspectorEntry =
   | {
       kind: 'ws_frame'
@@ -484,6 +794,23 @@ export type InspectorEntry =
       action: MjaiEvent
       meta?: Record<string, unknown>
       reaction_ms: number
+    }
+  | {
+      kind: 'http'
+      ts_ms: number
+      source: CaptureSource
+      // Backend serializes HttpExchange with #[serde(flatten)], so its
+      // fields land at the top level of the row, same as bot_reaction.
+      exchange_id?: string
+      phase: HttpPhase
+      method: string
+      url: string
+      host: string
+      version: string
+      status?: number
+      headers: HttpHeader[]
+      body?: HttpBody
+      annotations?: HttpAnnotation[]
     }
 
 export type InspectorKind = InspectorEntry['kind']

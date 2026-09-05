@@ -11,6 +11,7 @@ import type {
   MahgenView,
   MjaiEvent,
   Notification,
+  OverlayConfig,
   Snapshot,
 } from '@/types'
 import { useGameStore } from '@/stores/gameStore'
@@ -18,6 +19,7 @@ import { useAnalysisStore } from '@/stores/analysisStore'
 import { useBotStore } from '@/stores/botStore'
 import { useCaptureStore } from '@/stores/captureStore'
 import { useNotifyStore } from '@/stores/notifyStore'
+import { useApiStatusStore } from '@/stores/apiStatusStore'
 import { useInstallStore } from '@/stores/installStore'
 import { useConfigStore } from '@/stores/configStore'
 import { useHistoryStore } from '@/stores/historyStore'
@@ -94,6 +96,8 @@ export function useTauriBridge() {
     })()
 
     listen<MjaiEvent>('mjai-event', (e) => {
+      // Fresh game: clear any lingering online-API outage from the last one.
+      if (e.type === 'start_game') useApiStatusStore.getState().reset()
       useNotifyStore.getState().pushEvent(e)
       void refreshGame()
     }).then((u) => unlistens.push(u))
@@ -114,6 +118,13 @@ export function useTauriBridge() {
       useNotifyStore.getState().pushResponse(r)
     }).then((u) => unlistens.push(u))
 
+    // The overlay window can turn itself off (its × button). Mirror that back
+    // into the config store so the Game page's toggle doesn't keep claiming the
+    // overlay is open.
+    listen<OverlayConfig>('overlay-config', (o) => {
+      useConfigStore.getState().setOverlay(o)
+    }).then((u) => unlistens.push(u))
+
     listen<HistoryEvent>('history-recorded', (ev) => {
       if (ev.kind === 'recorded') {
         useHistoryStore.getState().prepend(ev.record)
@@ -124,6 +135,13 @@ export function useTauriBridge() {
 
     listen<Notification>('notify', (n) => {
       useNotifyStore.getState().pushToast(n)
+      // Drive the persistent "Online API" health indicator (Statusbar) off the
+      // same channel the backend uses for degrade/recover toasts.
+      if (n.id === 'native-api-health') {
+        useApiStatusStore
+          .getState()
+          .setDegraded(n.level === 'warn' || n.level === 'error', n.body)
+      }
       // Feed env install/sync progress to the blocking overlay (which is
       // shown for the duration of `withInstallBlock`). Ids: `bot-install-*`
       // (GitHub install/reinstall) and `bot-sync-*` ("Reinstall environment").

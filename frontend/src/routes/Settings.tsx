@@ -26,6 +26,7 @@ import {
 import { HAS_TAURI, invoke } from '@/lib/tauri'
 import { openExternal } from '@/lib/external'
 import { useSidebar } from '@/hooks/useSidebar'
+import { useAnnouncementStore } from '@/stores/announcementStore'
 import { useCaptureStore } from '@/stores/captureStore'
 import { useConfigStore } from '@/stores/configStore'
 import { selectHasNotifiableUpdate, useUpdaterStore } from '@/stores/updaterStore'
@@ -50,15 +51,36 @@ import {
   isKnownDefaultStartUrl,
   platformInfo,
 } from '@/lib/platforms'
-import type { AppConfig, CaptureMode, DetectedBrowser, PlatformKind } from '@/types'
+import {
+  OVERLAY_OPACITY_MAX,
+  OVERLAY_OPACITY_MIN,
+  OVERLAY_TOP_N_MAX,
+  OVERLAY_TOP_N_MIN,
+} from '@/types'
+import type {
+  AppConfig,
+  CaptureMode,
+  DelayMode,
+  DelayModelConfig,
+  DetectedBrowser,
+  GithubMirrorMode,
+  NetworkConfig,
+  OverlayConfig,
+  PlatformKind,
+} from '@/types'
 
 export function Settings() {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const stored = useConfigStore((s) => s.config)
   const setStored = useConfigStore((s) => s.setConfig)
   const [draft, setDraft] = useState<AppConfig | null>(stored)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  // Riichi City autoplay is MITM frame injection — pop a risk warning the
+  // moment the draft combines the two, from either direction (platform
+  // switched to Riichi City while autoplay is on, or autoplay switched on
+  // while the platform is Riichi City).
+  const [rcAutoplayWarnOpen, setRcAutoplayWarnOpen] = useState(false)
 
   useEffect(() => {
     // Sync the editable draft from the store when it (re)loads.
@@ -154,10 +176,14 @@ export function Settings() {
           <CardTitle>{t('settings.general')}</CardTitle>
         </CardHeader>
         <CardContent className="grid gap-4">
+          {/* Language applies instantly and self-persists to localStorage via
+              i18next, mirroring the setup wizard and the sidebar switcher.
+              It is intentionally decoupled from the config draft/save flow —
+              nothing reads config.general.language to drive the UI language. */}
           <Field label={t('settings.language')}>
             <Select
-              value={draft.general.language}
-              onValueChange={(v) => setDraft({ ...draft, general: { ...draft.general, language: v } })}
+              value={i18n.language}
+              onValueChange={(v) => void i18n.changeLanguage(v)}
             >
               <SelectTrigger className="w-full">
                 <SelectValue />
@@ -170,12 +196,30 @@ export function Settings() {
               </SelectContent>
             </Select>
           </Field>
+          <div className="grid gap-1.5">
+            <Toggle
+              label={t('settings.developer_mode')}
+              value={draft.general.developer_mode}
+              onChange={(v) =>
+                setDraft({ ...draft, general: { ...draft.general, developer_mode: v } })
+              }
+            />
+            <span className="text-xs text-muted-foreground">
+              {t('settings.developer_mode_hint')}
+            </span>
+          </div>
         </CardContent>
       </Card>
 
       <AppearanceCard />
 
-      <PlatformCard draft={draft} setDraft={setDraft} />
+      <OverlayCard draft={draft} setDraft={setDraft} />
+
+      <PlatformCard
+        draft={draft}
+        setDraft={setDraft}
+        onRiichiCityAutoplay={() => setRcAutoplayWarnOpen(true)}
+      />
 
       <CaptureCard draft={draft} setDraft={setDraft} />
 
@@ -245,7 +289,13 @@ export function Settings() {
         </CardContent>
       </Card>
 
-      <AutoplayCard draft={draft} setDraft={setDraft} />
+      <AutoplayCard
+        draft={draft}
+        setDraft={setDraft}
+        onRiichiCityAutoplay={() => setRcAutoplayWarnOpen(true)}
+      />
+
+      <NetworkCard draft={draft} setDraft={setDraft} />
 
       <UpdatesCard />
 
@@ -275,7 +325,169 @@ export function Settings() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog open={rcAutoplayWarnOpen} onOpenChange={setRcAutoplayWarnOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('settings.autoplay.rc_warning_title')}</DialogTitle>
+            <DialogDescription>
+              {t('settings.autoplay.rc_warning_desc')}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="bg-transparent p-0 border-0 mx-0 mb-0">
+            <Button size="sm" onClick={() => setRcAutoplayWarnOpen(false)}>
+              {t('settings.autoplay.rc_warning_ack')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
+  )
+}
+
+/** GitHub download routing — accelerator-mirror fallback for regions where
+ *  GitHub is blocked. Used by the in-app updater and the bot installer;
+ *  Chrome-for-Testing downloads fall back to a mirror automatically and
+ *  need no setting here. */
+function NetworkCard({
+  draft,
+  setDraft,
+}: {
+  draft: AppConfig
+  setDraft: (c: AppConfig) => void
+}) {
+  const { t } = useTranslation()
+  const n = draft.network
+  const patch = (p: Partial<NetworkConfig>) =>
+    setDraft({ ...draft, network: { ...n, ...p } })
+  const custom = n.github_custom_mirror.trim()
+  const customInvalid = custom !== '' && !/^https?:\/\/\S+$/.test(custom)
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t('settings.network_title')}</CardTitle>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <Field
+          label={t('settings.github_mirror_label')}
+          hint={t('settings.github_mirror_hint')}
+        >
+          <Select
+            value={n.github_mirror_mode}
+            onValueChange={(v) => patch({ github_mirror_mode: v as GithubMirrorMode })}
+          >
+            <SelectTrigger className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto">{t('settings.github_mirror_auto')}</SelectItem>
+              <SelectItem value="direct">{t('settings.github_mirror_direct')}</SelectItem>
+              <SelectItem value="mirror">{t('settings.github_mirror_mirror')}</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field
+          label={t('settings.custom_mirror_label')}
+          hint={t('settings.custom_mirror_hint')}
+        >
+          <Input
+            value={n.github_custom_mirror}
+            onChange={(e) => patch({ github_custom_mirror: e.target.value })}
+            placeholder="https://gh-proxy.com"
+            className="font-mono"
+            disabled={n.github_mirror_mode === 'direct'}
+          />
+          {customInvalid && (
+            <span className="text-xs text-red-400">
+              {t('settings.custom_mirror_invalid')}
+            </span>
+          )}
+        </Field>
+      </CardContent>
+    </Card>
+  )
+}
+
+/** The always-on-top suggestion overlay. Applied on save, like every other
+ *  card here — `update_config` opens, closes, or retunes the window. */
+function OverlayCard({
+  draft,
+  setDraft,
+}: {
+  draft: AppConfig
+  setDraft: (c: AppConfig) => void
+}) {
+  const { t } = useTranslation()
+  const o = draft.overlay
+  const patch = (p: Partial<OverlayConfig>) =>
+    setDraft({ ...draft, overlay: { ...o, ...p } })
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t('settings.overlay')}</CardTitle>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-1.5">
+          <Toggle
+            label={t('settings.overlay_enabled')}
+            value={o.enabled}
+            onChange={(v) => patch({ enabled: v })}
+          />
+          <span className="text-xs text-muted-foreground">
+            {t('settings.overlay_enabled_hint')}
+          </span>
+        </div>
+
+        <div className="grid gap-1.5">
+          <div className="flex items-center justify-between">
+            <Label>{t('settings.overlay_top_n')}</Label>
+            <span className="w-12 text-right font-mono text-sm tabular-nums">{o.top_n}</span>
+          </div>
+          <input
+            type="range"
+            min={OVERLAY_TOP_N_MIN}
+            max={OVERLAY_TOP_N_MAX}
+            step={1}
+            value={o.top_n}
+            onChange={(e) => patch({ top_n: parseInt(e.target.value, 10) })}
+            className="w-full accent-primary"
+            aria-label={t('settings.overlay_top_n')}
+          />
+        </div>
+
+        <div className="grid gap-1.5">
+          <div className="flex items-center justify-between">
+            <Label>{t('settings.overlay_opacity')}</Label>
+            <span className="w-12 text-right font-mono text-sm tabular-nums">
+              {Math.round(o.opacity * 100)}%
+            </span>
+          </div>
+          <input
+            type="range"
+            min={OVERLAY_OPACITY_MIN}
+            max={OVERLAY_OPACITY_MAX}
+            step={0.05}
+            value={o.opacity}
+            onChange={(e) => patch({ opacity: parseFloat(e.target.value) })}
+            className="w-full accent-primary"
+            aria-label={t('settings.overlay_opacity')}
+          />
+        </div>
+
+        <div className="grid gap-1.5">
+          <Toggle
+            label={t('settings.overlay_always_on_top')}
+            value={o.always_on_top}
+            onChange={(v) => patch({ always_on_top: v })}
+          />
+          <span className="text-xs text-muted-foreground">
+            {t('settings.overlay_always_on_top_hint')}
+          </span>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -545,27 +757,36 @@ function UiScaleField() {
 function PlatformCard({
   draft,
   setDraft,
+  onRiichiCityAutoplay,
 }: {
   draft: AppConfig
   setDraft: (c: AppConfig) => void
+  onRiichiCityAutoplay: () => void
 }) {
   const { t } = useTranslation()
   const current = draft.platform.kind
   const setKind = (kind: PlatformKind) => {
     if (kind === current) return
+    if (kind === 'RiichiCity' && (draft.autoplay?.enabled ?? false)) {
+      onRiichiCityAutoplay()
+    }
     // If the user hasn't customised the Chromium start URL, swap it to
     // the new platform's default so the next launch lands on the right
     // game. A user-customised URL is left alone — the URL field below
     // shows the platform default as a hint either way.
+    const info = platformInfo(kind)
     const oldStart = draft.capture.chromium.start_url
     const nextStart = isKnownDefaultStartUrl(oldStart)
-      ? platformInfo(kind).defaultStartUrl
+      ? info.defaultStartUrl
       : oldStart
     setDraft({
       ...draft,
       platform: { kind },
       capture: {
         ...draft.capture,
+        // Native-only platforms (no web client) are MITM-only — force the
+        // mode so we never persist an unusable Chromium capture for them.
+        mode: info.supportsChromium ? draft.capture.mode : 'mitm',
         chromium: { ...draft.capture.chromium, start_url: nextStart },
       },
     })
@@ -603,9 +824,11 @@ function PlatformCard({
 function AutoplayCard({
   draft,
   setDraft,
+  onRiichiCityAutoplay,
 }: {
   draft: AppConfig
   setDraft: (c: AppConfig) => void
+  onRiichiCityAutoplay: () => void
 }) {
   const { t } = useTranslation()
   const ap = draft.autoplay ?? {
@@ -616,16 +839,29 @@ function AutoplayCard({
       inter_click_delay_ms: 300,
       hover_delay_ms: 150,
       click_hold_ms: 50,
+      verify_input_ms: 300,
+      click_retries: 2,
+      reload_after_failures: 3,
       dealer_first_discard_extra_delay_ms: 2000,
     },
+    delay: defaultDelayModel(),
   }
+  const delay = ap.delay ?? defaultDelayModel()
   const captureIsChromium = draft.capture?.mode === 'chromium'
+  // Riichi City autoplay runs through the MITM proxy (frame injection), so
+  // the Chromium-mode requirement only applies to the click platforms.
+  const platformIsRiichiCity = draft.platform?.kind === 'RiichiCity'
   const setApField = (patch: Partial<typeof ap>) =>
     setDraft({ ...draft, autoplay: { ...ap, ...patch } })
   const setMajsoulField = (patch: Partial<typeof ap.majsoul>) =>
     setDraft({
       ...draft,
       autoplay: { ...ap, majsoul: { ...ap.majsoul, ...patch } },
+    })
+  const setDelayField = (patch: Partial<DelayModelConfig>) =>
+    setDraft({
+      ...draft,
+      autoplay: { ...ap, delay: { ...delay, ...patch } },
     })
   return (
     <Card>
@@ -636,38 +872,104 @@ function AutoplayCard({
         <Toggle
           label={t('settings.autoplay.enable')}
           value={ap.enabled}
-          onChange={(v) => setApField({ enabled: v })}
+          onChange={(v) => {
+            setApField({ enabled: v })
+            if (v && platformIsRiichiCity) onRiichiCityAutoplay()
+          }}
         />
         <p className="text-xs text-muted-foreground">
           {t('settings.autoplay.enable_help')}
         </p>
-        {ap.enabled && !captureIsChromium && (
+        {ap.enabled && !captureIsChromium && !platformIsRiichiCity && (
           <p className="text-xs text-amber-500">
             {t('settings.autoplay.requires_chromium')}
           </p>
         )}
-        <Field label={t('settings.autoplay.pre_click_delay_min')}>
+        {/* Delay policy: exactly one of legacy (fixed uniform) or the
+            Lua-scripted human-like model is active. */}
+        <Field label={t('settings.autoplay.delay_mode')}>
+          <Select
+            value={delay.mode}
+            onValueChange={(v) => setDelayField({ mode: v as DelayMode })}
+          >
+            <SelectTrigger className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="lua">
+                {t('settings.autoplay.delay_mode_lua')}
+              </SelectItem>
+              <SelectItem value="legacy">
+                {t('settings.autoplay.delay_mode_legacy')}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+        {delay.mode === 'lua' && (
+          <p className="text-xs text-muted-foreground">
+            {t('settings.autoplay.delay_mode_lua_help')}
+          </p>
+        )}
+        {delay.mode === 'legacy' && (
+          <>
+            <Field label={t('settings.autoplay.pre_click_delay_min')}>
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={0}
+                value={ap.majsoul.pre_click_delay_min_ms}
+                onChange={(e) =>
+                  setMajsoulField({
+                    pre_click_delay_min_ms: Number(e.target.value || 0),
+                  })
+                }
+              />
+            </Field>
+            <Field label={t('settings.autoplay.pre_click_delay_max')}>
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={0}
+                value={ap.majsoul.pre_click_delay_max_ms}
+                onChange={(e) =>
+                  setMajsoulField({
+                    pre_click_delay_max_ms: Number(e.target.value || 0),
+                  })
+                }
+              />
+            </Field>
+          </>
+        )}
+        <Field
+          label={t('settings.autoplay.min_delay')}
+          hint={t('settings.autoplay.min_delay_hint')}
+        >
           <Input
             type="number"
             inputMode="numeric"
             min={0}
-            value={ap.majsoul.pre_click_delay_min_ms}
+            value={delay.min_delay_ms}
             onChange={(e) =>
-              setMajsoulField({
-                pre_click_delay_min_ms: Number(e.target.value || 0),
+              // Clamp: a typed negative would fail u32 deserialization
+              // on save (min={0} doesn't block typing a minus sign).
+              setDelayField({
+                min_delay_ms: Math.max(0, Number(e.target.value || 0)),
               })
             }
           />
         </Field>
-        <Field label={t('settings.autoplay.pre_click_delay_max')}>
+        <Field
+          label={t('settings.autoplay.min_button_delay')}
+          hint={t('settings.autoplay.min_button_delay_hint')}
+        >
           <Input
             type="number"
             inputMode="numeric"
             min={0}
-            value={ap.majsoul.pre_click_delay_max_ms}
+            value={delay.min_button_delay_ms}
             onChange={(e) =>
-              setMajsoulField({
-                pre_click_delay_max_ms: Number(e.target.value || 0),
+              setDelayField({
+                min_button_delay_ms: Math.max(0, Number(e.target.value || 0)),
               })
             }
           />
@@ -715,6 +1017,54 @@ function AutoplayCard({
           />
         </Field>
         <Field
+          label={t('settings.autoplay.verify_input')}
+          hint={t('settings.autoplay.verify_input_hint')}
+        >
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            value={ap.majsoul.verify_input_ms}
+            onChange={(e) =>
+              setMajsoulField({
+                verify_input_ms: Number(e.target.value || 0),
+              })
+            }
+          />
+        </Field>
+        <Field
+          label={t('settings.autoplay.click_retries')}
+          hint={t('settings.autoplay.click_retries_hint')}
+        >
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            value={ap.majsoul.click_retries}
+            onChange={(e) =>
+              setMajsoulField({
+                click_retries: Number(e.target.value || 0),
+              })
+            }
+          />
+        </Field>
+        <Field
+          label={t('settings.autoplay.reload_after_failures')}
+          hint={t('settings.autoplay.reload_after_failures_hint')}
+        >
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            value={ap.majsoul.reload_after_failures}
+            onChange={(e) =>
+              setMajsoulField({
+                reload_after_failures: Number(e.target.value || 0),
+              })
+            }
+          />
+        </Field>
+        <Field
           label={t('settings.autoplay.dealer_first_discard_extra_delay')}
           hint={t('settings.autoplay.dealer_first_discard_extra_delay_hint')}
         >
@@ -738,6 +1088,31 @@ function AutoplayCard({
   )
 }
 
+/** Mirror of `DelayModelConfig::default()` on the Rust side. */
+function defaultDelayModel(): DelayModelConfig {
+  return {
+    mode: 'lua',
+    min_delay_ms: 1000,
+    min_button_delay_ms: 1600,
+    distribution: 'log_normal',
+    lognormal: {
+      dahai_tedashi: [0.87, 0.62],
+      dahai_tsumogiri: [0.52, 0.53],
+      post_call_dahai: [0.52, 0.42],
+      reach: [1.1, 0.55],
+      claim: [0.26, 0.57],
+      hora: [0.15, 0.5],
+    },
+    bank_on_long_thought: true,
+    riichi_extra_ms: 0,
+    kan_extra_ms: 0,
+    safety_margin_ms: 1000,
+    bank_use_fraction: 0.25,
+    bank_max_single_ms: 5000,
+    no_budget_cap_ms: 15000,
+  }
+}
+
 function CaptureCard({
   draft,
   setDraft,
@@ -746,7 +1121,10 @@ function CaptureCard({
   setDraft: (c: AppConfig) => void
 }) {
   const { t } = useTranslation()
-  const mode: CaptureMode = draft.capture?.mode ?? 'mitm'
+  const supportsChromium = platformInfo(draft.platform.kind).supportsChromium
+  // Native-only platforms (no web client) are MITM-only; present MITM as the
+  // effective mode even if a stale config selected Chromium.
+  const mode: CaptureMode = supportsChromium ? (draft.capture?.mode ?? 'mitm') : 'mitm'
   const chromium = draft.capture?.chromium ?? {
     executable: '',
     user_data_dir: '',
@@ -811,10 +1189,16 @@ function CaptureCard({
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="mitm">{t('settings.capture_mitm_option')}</SelectItem>
-              <SelectItem value="chromium">{t('settings.capture_chromium_option')}</SelectItem>
+              <SelectItem value="chromium" disabled={!supportsChromium}>
+                {t('settings.capture_chromium_option')}
+              </SelectItem>
             </SelectContent>
           </Select>
         </Field>
+
+        {!supportsChromium && (
+          <p className="text-xs text-amber-500">{t('settings.capture_mitm_only')}</p>
+        )}
 
         {mode === 'mitm' && (
           <>
@@ -836,6 +1220,14 @@ function CaptureCard({
                 onChange={(e) => setDraft({ ...draft, proxy: { ...draft.proxy, ca_dir: e.target.value } })}
               />
             </Field>
+            <Toggle
+              label={t('settings.block_telemetry')}
+              value={draft.proxy.block_telemetry}
+              onChange={(v) => setDraft({ ...draft, proxy: { ...draft.proxy, block_telemetry: v } })}
+            />
+            <span className="text-xs text-muted-foreground">
+              {t('settings.block_telemetry_hint')}
+            </span>
           </>
         )}
 
@@ -1113,16 +1505,25 @@ function UpdatesCard() {
             )}
           </div>
         </Field>
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <span className="text-xs text-muted-foreground">{lastCheckedLabel}</span>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={handleCheck}
-            disabled={checking || !HAS_TAURI}
-          >
-            {checking ? t('updates.settings.checking') : t('updates.settings.check_now')}
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => useAnnouncementStore.getState().openHistory()}
+            >
+              {t('announcements.dialog.settings_button')}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleCheck}
+              disabled={checking || !HAS_TAURI}
+            >
+              {checking ? t('updates.settings.checking') : t('updates.settings.check_now')}
+            </Button>
+          </div>
         </div>
         <Toggle
           label={t('updates.settings.auto_check')}

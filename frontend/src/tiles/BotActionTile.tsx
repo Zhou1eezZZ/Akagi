@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { TileFrame } from '@/components/TileFrame'
 import { Mahgen } from '@/components/Mahgen'
 import { useNotifyStore } from '@/stores/notifyStore'
+import { hexToRgba } from '@/lib/botShow'
 import { useBotHoraScore } from '@/lib/botHoraScore'
 import { mjaiToMahgen } from '@/lib/tileIdx'
 import type { Breakpoint } from '@/tiles/defaults'
@@ -28,7 +29,10 @@ type Variant = {
   glyph: string
   /** Translucent background tint. Null disables the tinted backdrop. */
   color: string | null
-  /** Tint for the left calligraphy glyph (a black-on-transparent PNG). Dahai = white. */
+  /** Tint for the left calligraphy glyph (a black-on-transparent PNG). The
+   *  achromatic glyphs (dahai 打 / none) use theme-aware CSS vars
+   *  (`var(--bot-glyph-*)`) so they stay legible in light mode; colored
+   *  actions carry their own hex. */
   glyphColor: string
   /** i18n key for the action label (under `mahjong.*`). */
   labelKey: string
@@ -47,7 +51,7 @@ function describe(r: BotResponse, t: (k: string, opts?: Record<string, unknown>)
       return {
         glyph: dahaiGlyph,
         color: null,
-        glyphColor: '#ffffff',
+        glyphColor: 'var(--bot-glyph-neutral)',
         labelKey: 'mahjong.dahai',
         extra: '',
         mahgen: mjaiToMahgen([r.pai]),
@@ -153,7 +157,7 @@ function describe(r: BotResponse, t: (k: string, opts?: Record<string, unknown>)
       return {
         glyph: noneGlyph,
         color: '#a0a0a0',
-        glyphColor: '#d3d3d3',
+        glyphColor: 'var(--bot-glyph-muted)',
         labelKey: 'mahjong.none',
         extra: t('mahjong.skip'),
         mahgen: '',
@@ -161,15 +165,6 @@ function describe(r: BotResponse, t: (k: string, opts?: Record<string, unknown>)
     default:
       return null
   }
-}
-
-// "#aabbcc" → "rgba(170,187,204,a)". Returns null when input isn't a valid hex.
-function hexToRgba(hex: string | null, alpha: number): string | undefined {
-  if (!hex) return undefined
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim())
-  if (!m) return undefined
-  const n = parseInt(m[1], 16)
-  return `rgba(${(n >> 16) & 0xff}, ${(n >> 8) & 0xff}, ${n & 0xff}, ${alpha})`
 }
 
 export function BotActionTile({ bp }: { bp: Breakpoint }) {
@@ -218,17 +213,26 @@ export function BotActionTile({ bp }: { bp: Breakpoint }) {
   // runs on the pre-mask solid rectangle (no edges → no shadow). The wrapper
   // owns the filter; the inner div owns the mask + tinted fill, and the
   // wrapper's filter then composites against the inner's masked output.
+  //
+  // The achromatic glyphs (dahai 打 / none) carry a CSS-var fill, which
+  // hexToRgba can't parse — a JS-computed bloom would fall back to black and
+  // smear a heavy black halo (ugly on the light card, invisible on dark). They
+  // use a theme-aware filter token instead; colour glyphs keep their hex-tinted
+  // glow.
+  const isNeutralGlyph = variant?.glyphColor.startsWith('var(')
   const glyphFilter = variant
-    ? {
-        // Layered shadows: wide diffuse colour bloom → tighter colour halo →
-        // soft directional drop. Together they emphasize the glyph without
-        // hard edges, so it reads as glowing rather than stamped on.
-        filter: [
-          `drop-shadow(0 0 10px ${hexToRgba(variant.glyphColor, 0.55) ?? 'rgba(0,0,0,0.5)'})`,
-          `drop-shadow(0 0 4px ${hexToRgba(variant.glyphColor, 0.45) ?? 'rgba(0,0,0,0.4)'})`,
-          'drop-shadow(0 2px 5px rgba(0,0,0,0.55))',
-        ].join(' '),
-      }
+    ? isNeutralGlyph
+      ? { filter: 'var(--bot-glyph-filter)' }
+      : {
+          // Layered shadows: wide diffuse colour bloom → tighter colour halo →
+          // soft directional drop. Together they emphasize the glyph without
+          // hard edges, so it reads as glowing rather than stamped on.
+          filter: [
+            `drop-shadow(0 0 10px ${hexToRgba(variant.glyphColor, 0.55) ?? 'rgba(0,0,0,0.5)'})`,
+            `drop-shadow(0 0 4px ${hexToRgba(variant.glyphColor, 0.45) ?? 'rgba(0,0,0,0.4)'})`,
+            'drop-shadow(0 2px 5px rgba(0,0,0,0.55))',
+          ].join(' '),
+        }
     : undefined
   const glyphMask = variant
     ? {

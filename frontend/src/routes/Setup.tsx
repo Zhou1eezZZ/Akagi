@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -14,12 +14,18 @@ import {
 } from '@/components/ui/select'
 import { Toaster } from '@/components/ui/sonner'
 import { InstallBlockingOverlay } from '@/components/InstallBlockingOverlay'
+import { NativeApiFields } from '@/components/NativeApiFields'
 import { invoke } from '@/lib/tauri'
 import { withInstallBlock } from '@/lib/install'
+import { checkApiBeforeSave } from '@/lib/nativeApi'
+import { mergeExternal } from '@/lib/merge'
+import { withFirstRunCaptureDefault } from '@/lib/setupDefaults'
 import { useTauriBridge } from '@/hooks/useTauriBridge'
 import { useConfigStore } from '@/stores/configStore'
 import { ManifestField } from '@/components/ManifestField'
 import { GithubMark, DiscordMark } from '@/components/BrandMarks'
+import { MjotLogo } from '@/components/MjotBrand'
+import { NATIVE_3P, NATIVE_4P, isNativeBot } from '@/lib/nativeBots'
 import { AKAGI_GITHUB_URL, AKAGI_DISCORD_URL, openExternal } from '@/lib/external'
 import { PLATFORMS, platformInfo } from '@/lib/platforms'
 import { LANG_LABELS, SUPPORTED_LANGS, type SupportedLang } from '@/i18n'
@@ -27,7 +33,11 @@ import type { AppConfig, BotInfo, BotSettings, DetectedBrowser, PlatformKind } f
 
 type Step = 'welcome' | 'platform' | 'mode' | 'config' | 'bots' | 'configure' | 'finish'
 
-const STEPS: Step[] = ['welcome', 'platform', 'mode', 'config', 'bots', 'configure', 'finish']
+// The 'bots' (install Mortal from GitHub) step is intentionally omitted: the
+// built-in native bot is the zero-install default, so the wizard no longer
+// installs an author bot. The 'configure' (bot settings) step is kept as the
+// future home for built-in-bot settings. `BotsStep` is retained but unreachable.
+const STEPS: Step[] = ['welcome', 'platform', 'mode', 'config', 'configure', 'finish']
 
 // Author-provided MJAI bots installed by the first-run wizard. Same
 // install path as the manual Bots → Install From GitHub flow, just
@@ -37,6 +47,9 @@ const BOT_4P_NAME = 'mortal'
 const BOT_3P_NAME = 'mortal3p'
 const BOT_4P_ASSET = 'release4p.zip'
 const BOT_3P_ASSET = 'release3p.zip'
+// The built-in bots (shared names from `@/lib/nativeBots`) are always
+// available (weights are embedded in the binary), so a native active bot is a
+// working assistant — the wizard must not report "no bot / no analysis".
 
 export function Setup() {
   const { t } = useTranslation()
@@ -46,7 +59,14 @@ export function Setup() {
   useTauriBridge()
   const stored = useConfigStore((s) => s.config)
   const setStored = useConfigStore((s) => s.setConfig)
-  const [draft, setDraft] = useState<AppConfig | null>(stored)
+  // Seed the editable draft. On a genuine first run this also pre-selects the
+  // Chromium capture backend (see `withFirstRunCaptureDefault`); a re-run keeps
+  // the user's saved mode. Idempotent, so seeding here and in the effect below
+  // (whichever path fires first depending on whether `stored` was ready at
+  // mount) yields the same draft.
+  const [draft, setDraft] = useState<AppConfig | null>(() =>
+    stored ? withFirstRunCaptureDefault(stored) : null,
+  )
   const [step, setStep] = useState<Step>('welcome')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -58,14 +78,30 @@ export function Setup() {
   // MUST live above the early-return below — React forbids skipping a
   // hook on first render and then calling it on subsequent renders.
   const [botSettingsDraft, setBotSettingsDraft] = useState<Record<string, BotSettings>>({})
+  // Stored-config snapshot the wizard draft was last synced against — the
+  // merge base for folding external config changes into the open draft.
+  const syncedStoredRef = useRef<AppConfig | null>(stored)
 
   // True when the user is re-running setup from Settings (not first run).
   const isRerun = params.get('rerun') === '1' || stored?.general.first_run_completed === true
 
   useEffect(() => {
-    // Sync the editable draft from the store when it (re)loads.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (stored) setDraft(stored)
+    if (!stored) return
+    const prev = syncedStoredRef.current
+    syncedStoredRef.current = stored
+    if (!prev) {
+      // Seed the editable draft once the config loads (first run → Chromium
+      // pre-selected; see the useState initializer above).
+      setDraft(withFirstRunCaptureDefault(stored))
+      return
+    }
+    // The stored config changed mid-wizard (e.g. the purchase store persisted
+    // a delivered API key while the buyer was on another step). Three-way
+    // merge instead of re-seeding: only fields the user hasn't modified
+    // relative to the previous stored snapshot adopt the new stored value —
+    // recursively, so nested sections like `bot.api` merge per field — and
+    // every not-yet-saved wizard choice (platform, capture mode, …) survives.
+    setDraft((cur) => (cur ? mergeExternal(cur, prev, stored) : stored))
   }, [stored])
 
   useEffect(() => {
@@ -99,6 +135,21 @@ export function Setup() {
       setBusy(true)
       setErr(null)
       try {
+        // Same guard as the Bots page Save: if cloud inference is enabled,
+        // the key must work before we let the wizard advance — otherwise Finish
+        // would persist an enabled-but-broken API that silently falls back to
+        // the local model. Checked here (not on Finish) so the error surfaces
+        // right by the API fields; the user must fix the key or turn it off.
+        const check = await checkApiBeforeSave(draft.bot.api)
+        if (!check.ok) {
+          setErr(
+            check.kind === 'missing'
+              ? `${t('bots.api.save_key_check_failed')} ${t('bots.api.need_url_key')}`
+              : `${t('bots.api.save_key_check_failed')} ${check.message}`,
+          )
+          setBusy(false)
+          return
+        }
         await saveBotSettings()
       } catch (e) {
         setErr(String(e))
@@ -134,13 +185,18 @@ export function Setup() {
         general: { ...draft.general, first_run_completed: true },
         bot: {
           ...draft.bot,
-          // Auto-enable + select author bots when the wizard installed
-          // them. Don't downgrade an existing custom config (e.g. user
-          // re-runs setup but keeps their own bot.active_4p): only
-          // touch active_* when the corresponding bot is present.
-          enabled: draft.bot.enabled || has4p || has3p,
-          active_4p: has4p ? BOT_4P_NAME : draft.bot.active_4p,
-          active_3p: has3p ? BOT_3P_NAME : draft.bot.active_3p,
+          // Enable the assistant on setup completion: there's always a working
+          // zero-install built-in bot (the BotConfig defaults select it), so
+          // the user gets recommendations out of the box.
+          //
+          // Active-bot pick, in priority order: MJOT enabled → the built-in
+          // bots (cloud inference only applies to them — selecting an author
+          // bot here would finish the wizard with an enabled API nothing
+          // uses); else author bots installed by a previous run → keep them;
+          // else the defaults (built-in native bot) stand.
+          enabled: true,
+          active_4p: draft.bot.api.enabled ? NATIVE_4P : has4p ? BOT_4P_NAME : draft.bot.active_4p,
+          active_3p: draft.bot.api.enabled ? NATIVE_3P : has3p ? BOT_3P_NAME : draft.bot.active_3p,
         },
       }
       await invoke('update_config', { newConfig: final })
@@ -177,6 +233,8 @@ export function Setup() {
           {step === 'bots' && <BotsStep />}
           {step === 'configure' && (
             <ConfigureBotsStep
+              draft={draft}
+              setDraft={setDraft}
               drafts={botSettingsDraft}
               setDrafts={setBotSettingsDraft}
             />
@@ -245,14 +303,18 @@ function PlatformStep({
   // step that comes next.
   const pick = (kind: PlatformKind) => {
     if (kind === current) return
+    const info = platformInfo(kind)
     setDraft({
       ...draft,
       platform: { kind },
       capture: {
         ...draft.capture,
+        // Native-only platforms (no web client) can't use Chromium capture —
+        // force MITM so the next steps configure the right backend.
+        mode: info.supportsChromium ? draft.capture.mode : 'mitm',
         chromium: {
           ...draft.capture.chromium,
-          start_url: platformInfo(kind).defaultStartUrl,
+          start_url: info.defaultStartUrl,
         },
       },
     })
@@ -346,13 +408,17 @@ function ModeStep({
   setDraft: (c: AppConfig) => void
 }) {
   const { t } = useTranslation()
-  const mode = draft.capture.mode
+  const supportsChromium = platformInfo(draft.platform.kind).supportsChromium
+  // A native-only platform can only be captured via MITM; never leave the
+  // draft on the (now unavailable) Chromium mode.
+  const mode = supportsChromium ? draft.capture.mode : 'mitm'
   return (
     <div className="grid gap-3">
       <h2 className="text-lg font-semibold">{t('setup.mode.title')}</h2>
       <ModeCard
         title={t('setup.mode.chromium_title')}
-        active={mode === 'chromium'}
+        active={supportsChromium && mode === 'chromium'}
+        disabled={!supportsChromium}
         onClick={() => setDraft({ ...draft, capture: { ...draft.capture, mode: 'chromium' } })}
         description={t('setup.mode.chromium_desc')}
       />
@@ -371,18 +437,25 @@ function ModeCard({
   description,
   active,
   onClick,
+  disabled = false,
 }: {
   title: string
   description: string
   active: boolean
   onClick: () => void
+  disabled?: boolean
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       className={`text-left rounded-md border p-4 transition-colors ${
-        active ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'
+        disabled
+          ? 'border-border opacity-50 cursor-not-allowed'
+          : active
+            ? 'border-primary bg-primary/5'
+            : 'border-border hover:border-primary/40'
       }`}
     >
       <div className="flex items-center gap-2">
@@ -706,9 +779,13 @@ function BotInstallCard({
 }
 
 function ConfigureBotsStep({
+  draft,
+  setDraft,
   drafts,
   setDrafts,
 }: {
+  draft: AppConfig
+  setDraft: (c: AppConfig) => void
   drafts: Record<string, BotSettings>
   setDrafts: React.Dispatch<React.SetStateAction<Record<string, BotSettings>>>
 }) {
@@ -756,68 +833,76 @@ function ConfigureBotsStep({
     (b) => b.name === BOT_4P_NAME || b.name === BOT_3P_NAME,
   )
 
-  if (installed === null) {
-    return <div className="text-sm text-muted-foreground">{t('setup.configure.loading')}</div>
-  }
-
-  if (wizardBots.length === 0) {
-    return (
-      <div className="grid gap-3">
-        <h2 className="text-lg font-semibold">{t('setup.configure.title')}</h2>
-        <p className="text-sm text-muted-foreground">
-          {t('setup.configure.empty_desc')}
-        </p>
-      </div>
-    )
-  }
-
   return (
     <div className="grid gap-4">
       <h2 className="text-lg font-semibold">{t('setup.configure.title')}</h2>
-      <p className="text-sm text-muted-foreground">
-        {t('setup.configure.normal_desc')}
-      </p>
 
-      {/* The Mortal weights bundled in the GitHub release are a
-          placeholder forced by GitHub's file-size limit — they prove
-          the install works but aren't strong enough for real play.
-          Point users at Discord for the real weights (paid hosted API
-          + free local models both live there) before they walk away
-          unimpressed by the placeholder's playstyle. */}
-      <div className="rounded-md border border-indigo-500/40 bg-indigo-500/10 p-3 grid gap-2">
-        <div className="flex items-center gap-2 text-indigo-200 font-semibold text-sm">
-          <DiscordMark className="h-4 w-4" />
-          {t('setup.configure.models_title')}
+      {/* Built-in bot: optional MJOT cloud inference. Shown first — the
+          built-in bot is the always-present default, so this is the primary
+          thing to configure here even when no author bots are installed.
+          The MJOT lockup is the heading (its wordmark reads "MJOT"); the
+          tagline underneath says what it is. */}
+      <div className="rounded-md border p-3 grid gap-3">
+        <div className="grid gap-1">
+          <MjotLogo className="h-7 w-auto justify-self-start" label="MJOT" />
+          <span className="text-xs text-muted-foreground">{t('bots.api.mjot_tagline')}</span>
         </div>
-        <p className="text-sm text-indigo-100/90">
-          {t('setup.configure.models_body')}
-        </p>
-        <div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => openExternal(AKAGI_DISCORD_URL)}
-          >
-            <DiscordMark className="h-4 w-4 mr-1.5" />
-            {t('setup.configure.models_btn')}
-          </Button>
-        </div>
-      </div>
-      {wizardBots.map((b) => (
-        <BotSettingsForm
-          key={b.name}
-          name={b.name}
-          loadError={loadErrors[b.name]}
-          settings={drafts[b.name]}
-          onChange={(values) =>
-            setDrafts((prev) => {
-              const cur = prev[b.name]
-              if (!cur) return prev
-              return { ...prev, [b.name]: { ...cur, values } }
-            })
-          }
+        <NativeApiFields
+          value={draft.bot.api}
+          onChange={(api) => setDraft({ ...draft, bot: { ...draft.bot, api } })}
         />
-      ))}
+      </div>
+
+      {/* Author-bot (Mortal) manifest settings — only when such bots are
+          installed from a previous run. */}
+      {installed === null ? (
+        <div className="text-sm text-muted-foreground">{t('setup.configure.loading')}</div>
+      ) : wizardBots.length > 0 ? (
+        <>
+          <p className="text-sm text-muted-foreground">
+            {t('setup.configure.normal_desc')}
+          </p>
+
+          {/* The Mortal weights bundled in the GitHub release are a
+              placeholder forced by GitHub's file-size limit — they prove
+              the install works but aren't strong enough for real play.
+              Point users at Discord for the real weights. */}
+          <div className="rounded-md border border-indigo-500/40 bg-indigo-500/10 p-3 grid gap-2">
+            <div className="flex items-center gap-2 text-indigo-200 font-semibold text-sm">
+              <DiscordMark className="h-4 w-4" />
+              {t('setup.configure.models_title')}
+            </div>
+            <p className="text-sm text-indigo-100/90">
+              {t('setup.configure.models_body')}
+            </p>
+            <div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => openExternal(AKAGI_DISCORD_URL)}
+              >
+                <DiscordMark className="h-4 w-4 mr-1.5" />
+                {t('setup.configure.models_btn')}
+              </Button>
+            </div>
+          </div>
+          {wizardBots.map((b) => (
+            <BotSettingsForm
+              key={b.name}
+              name={b.name}
+              loadError={loadErrors[b.name]}
+              settings={drafts[b.name]}
+              onChange={(values) =>
+                setDrafts((prev) => {
+                  const cur = prev[b.name]
+                  if (!cur) return prev
+                  return { ...prev, [b.name]: { ...cur, values } }
+                })
+              }
+            />
+          ))}
+        </>
+      ) : null}
     </div>
   )
 }
@@ -888,13 +973,21 @@ function FinishStep({ draft }: { draft: AppConfig }) {
   }, [])
   const has4p = installed?.some((b) => b.name === BOT_4P_NAME) ?? false
   const has3p = installed?.some((b) => b.name === BOT_3P_NAME) ?? false
-  const botSummary = has4p && has3p
-    ? `${BOT_4P_NAME} (4P), ${BOT_3P_NAME} (3P)`
-    : has4p
-      ? `${BOT_4P_NAME} (4P)`
-      : has3p
-        ? `${BOT_3P_NAME} (3P)`
-        : t('setup.finish.bots_none')
+  // Mirror what `finish()` actually persists: MJOT enabled → the built-in
+  // bots; else prefer the author Mortal bot when installed; else keep the
+  // configured active bot (which defaults to the built-in native bot). A
+  // native active bot is a working assistant, so the summary must reflect it
+  // instead of claiming analysis is unavailable.
+  const apiOn = draft.bot.api.enabled
+  const eff4p = apiOn ? NATIVE_4P : has4p ? BOT_4P_NAME : draft.bot.active_4p
+  const eff3p = apiOn ? NATIVE_3P : has3p ? BOT_3P_NAME : draft.bot.active_3p
+  const botLabel = (name: string) => (isNativeBot(name) ? t('bots.native_builtin') : name)
+  const botParts = [
+    eff4p ? `${botLabel(eff4p)} (4P)` : null,
+    eff3p ? `${botLabel(eff3p)} (3P)` : null,
+  ].filter((p): p is string => p !== null)
+  const botSummary =
+    botParts.length > 0 ? botParts.join(', ') : t('setup.finish.bots_none')
   return (
     <div className="grid gap-3">
       <h2 className="text-lg font-semibold">{t('setup.finish.title')}</h2>

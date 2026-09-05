@@ -1,13 +1,16 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useBlocker } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { Plus, Settings as SettingsIcon, RefreshCw, CheckCircle2, Trash2, FileArchive, Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -34,8 +37,21 @@ import { withInstallBlock } from '@/lib/install'
 import { toast } from '@/components/ui/sonner'
 import { useBotStore } from '@/stores/botStore'
 import { useConfigStore } from '@/stores/configStore'
-import type { AppConfig, BotInfo, BotSettings } from '@/types'
+import type { AppConfig, BotInfo, BotSettings, NativeApiConfig } from '@/types'
 import { ManifestField } from '@/components/ManifestField'
+import { MjotLogo } from '@/components/MjotBrand'
+import { NativeApiFields } from '@/components/NativeApiFields'
+import { checkApiBeforeSave, persistApiConfig, withNativeBotForApi } from '@/lib/nativeApi'
+import { NATIVE_3P, NATIVE_4P, isNativeBot } from '@/lib/nativeBots'
+import { proxyConfigValid } from '@/lib/proxy'
+import { mergeExternal } from '@/lib/merge'
+
+// The built-in bots have no directory, no manifest, and nothing to
+// install/configure/delete; names and the `isNativeBot` predicate come from
+// the shared `@/lib/nativeBots`.
+function nativeModes(name: string): string[] {
+  return name === NATIVE_3P ? ['3p'] : ['4p']
+}
 
 export function Bots() {
   const { t } = useTranslation()
@@ -82,6 +98,36 @@ export function Bots() {
     }
     try {
       await invoke('set_active_bot', { mode, name })
+      // Mirror of "enabling MJOT selects the built-in bots": deactivating the
+      // LAST built-in slot would leave the API enabled with nothing routing
+      // through it — dead config that reads as working. Turn it off and say
+      // so. One native slot remaining keeps the API on: it still serves that
+      // mode.
+      if (config?.bot.api.enabled) {
+        const next4p = mode === '4p' ? name : config.bot.active_4p
+        const next3p = mode === '3p' ? name : config.bot.active_3p
+        if (!isNativeBot(next4p) && !isNativeBot(next3p)) {
+          // Separate catch: the activation above already succeeded, so a
+          // failure HERE must not be reported as "activate failed" — the API
+          // just stayed enabled; the user can turn it off on the MJOT card.
+          try {
+            await persistApiConfig({ ...config.bot.api, enabled: false })
+            toast.info(t('bots.api.disabled_no_native'))
+          } catch (e) {
+            toast.error(t('bots.api.save_failed'), { description: String(e) })
+          }
+        } else if (name !== '' && !isNativeBot(name)) {
+          // Only this mode left the built-in bot; the other still uses it, so
+          // the API stays on — but say which mode MJOT no longer covers, or
+          // the user will assume both modes are served.
+          toast.info(
+            t('bots.api.mode_not_native', {
+              mode: mode === '4p' ? '4P' : '3P',
+              other: mode === '4p' ? '3P' : '4P',
+            }),
+          )
+        }
+      }
     } catch (e) {
       // set_active_bot rejects (e.g. env not installed) without emitting a
       // notify toast, so surface it here — otherwise the optimistic flip just
@@ -112,8 +158,16 @@ export function Bots() {
   }
 
   function supportsMode(bot: BotInfo, mode: '4p' | '3p'): boolean {
+    if (isNativeBot(bot.name)) return nativeModes(bot.name).includes(mode)
     const modes = bot.manifest?.bot.supported_modes ?? ['4p']
     return modes.includes(mode)
+  }
+
+  // Friendly label for the built-in bots (they have no manifest `display`).
+  function botLabel(bot: BotInfo): string {
+    if (bot.name === NATIVE_4P) return t('bots.native_4p')
+    if (bot.name === NATIVE_3P) return t('bots.native_3p')
+    return bot.manifest?.bot.display ?? bot.name
   }
 
   return (
@@ -129,6 +183,11 @@ export function Bots() {
           <InstallFromZipDialog onInstalled={refresh} />
         </div>
       </header>
+
+      {/* MJOT (cloud inference) leads the page: it is the built-in bot's main
+          upgrade knob, while the table below is the power-user path for
+          author bots. */}
+      <NativeApiSettings />
 
       <Table>
         <TableHeader>
@@ -156,11 +215,15 @@ export function Bots() {
               <TableRow key={bot.name}>
                 <TableCell>
                   <div className="flex flex-col">
-                    <span className="font-medium">{bot.manifest?.bot.display ?? bot.name}</span>
-                    <span className="text-xs text-muted-foreground font-mono">{bot.dir}</span>
+                    <span className="font-medium">{botLabel(bot)}</span>
+                    <span className="text-xs text-muted-foreground font-mono">
+                      {isNativeBot(bot.name) ? t('bots.native_builtin') : bot.dir}
+                    </span>
                   </div>
                 </TableCell>
-                <TableCell className="font-mono text-xs">{bot.manifest?.bot.version ?? '—'}</TableCell>
+                <TableCell className="font-mono text-xs">
+                  {isNativeBot(bot.name) ? t('bots.native_version') : (bot.manifest?.bot.version ?? '—')}
+                </TableCell>
                 <TableCell>{bot.manifest ? <CheckCircle2 className="h-4 w-4 text-emerald-400" /> : '—'}</TableCell>
                 <TableCell>
                   <span title={!bot.env_ready && !isActive4p ? t('bots.env_not_ready_tooltip') : undefined}>
@@ -184,6 +247,9 @@ export function Bots() {
                   </span>
                 </TableCell>
                 <TableCell className="text-right">
+                  {isNativeBot(bot.name) ? (
+                    <span className="text-xs text-muted-foreground">{t('bots.native_builtin')}</span>
+                  ) : (
                   <div className="flex items-center justify-end gap-1">
                     {bot.has_pyproject && !bot.env_ready && (
                       <Button
@@ -219,6 +285,7 @@ export function Bots() {
                       <Trash2 className="h-4 w-4" />
                     </Button>
                   </div>
+                  )}
                 </TableCell>
               </TableRow>
             )
@@ -558,6 +625,161 @@ function BotSettingsDrawer({ name, open, onOpenChange, onEnvChanged }: { name: s
         </div>
       </SheetContent>
     </Sheet>
+  )
+}
+
+// Cloud-inference settings for the built-in native bot, as a card on the Bots
+// tab. The field editor is shared with the Setup wizard (`NativeApiFields`);
+// here we wrap it in Card chrome and an explicit Save button.
+function NativeApiSettings() {
+  const { t } = useTranslation()
+  const config = useConfigStore((s) => s.config)
+  const setConfig = useConfigStore((s) => s.setConfig)
+  const api = config?.bot.api
+
+  const [draft, setDraft] = useState<NativeApiConfig | null>(null)
+  const [saving, setSaving] = useState(false)
+  // Stored `bot.api` snapshot the draft was last synced against — the merge
+  // base for folding external config changes into the open draft.
+  const syncedApiRef = useRef<NativeApiConfig | null>(null)
+
+  useEffect(() => {
+    if (!api) return
+    const prev = syncedApiRef.current
+    syncedApiRef.current = api
+    if (!prev) {
+      // Seed the editable draft once the config loads.
+      setDraft({ ...api })
+      return
+    }
+    // The stored config changed while the draft is open (e.g. a purchased key
+    // was delivered and persisted while the purchase dialog was unmounted).
+    // Three-way merge: fields the user hasn't touched (draft still equal to
+    // the previous stored snapshot) adopt the new stored value; fields the
+    // user edited keep their draft value. `dirty` below recomputes from the
+    // merged result, so Save can never silently revert a delivered key.
+    setDraft((cur) => (cur ? mergeExternal(cur, prev, api) : { ...api }))
+  }, [api])
+
+  // Same unsaved-changes guard as the Settings page: block in-app navigation
+  // while the draft differs from the stored config, and warn on window close.
+  // (A minted or purchased key never trips this: `onKeyMinted` persists it
+  // immediately, and external persists — e.g. the purchase store's fallback —
+  // are merged into the untouched draft fields above, so stored and draft
+  // only diverge where the user really has unsaved edits.)
+  const dirty = !!api && !!draft && JSON.stringify(draft) !== JSON.stringify(api)
+
+  const blocker = useBlocker(
+    ({ currentLocation, nextLocation }) =>
+      dirty && currentLocation.pathname !== nextLocation.pathname,
+  )
+
+  useEffect(() => {
+    if (!dirty) return
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [dirty])
+
+  if (!config || !draft) return null
+
+  const save = async (): Promise<boolean> => {
+    setSaving(true)
+    try {
+      // With cloud inference enabled, refuse to persist a key that doesn't
+      // work: a saved-but-broken key silently falls back to the local model
+      // every turn, so the user would think the API is on when it isn't. Block
+      // the save and surface why — they must fix the key or turn the API off.
+      const check = await checkApiBeforeSave(draft)
+      if (!check.ok) {
+        toast.error(t('bots.api.save_key_check_failed'), {
+          description: check.kind === 'missing' ? t('bots.api.need_url_key') : check.message,
+        })
+        return false
+      }
+      // Saving with the API enabled also selects the built-in bots — MJOT
+      // only applies to them, so leaving an author bot active would persist
+      // an enabled API that nothing uses.
+      const { next, switched } = withNativeBotForApi(config, draft)
+      await invoke('update_config', { newConfig: next })
+      setConfig(next)
+      toast.success(t('bots.api.saved'))
+      if (switched) toast.info(t('bots.api.native_selected'))
+      return true
+    } catch (e) {
+      toast.error(t('bots.api.save_failed'), { description: String(e) })
+      return false
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const saveAndLeave = async () => {
+    if (await save()) {
+      blocker.proceed?.()
+    } else {
+      blocker.reset?.()
+    }
+  }
+
+  const discardAndLeave = () => {
+    setDraft({ ...config.bot.api })
+    blocker.proceed?.()
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2.5">
+          {/* The lockup's wordmark reads "MJOT", so the visible title text
+              stays the descriptive half only. */}
+          <MjotLogo className="h-6 w-auto" label="MJOT" />
+          <span className="text-muted-foreground">·</span>
+          {t('bots.api.title')}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <NativeApiFields value={draft} onChange={setDraft} onKeyMinted={persistApiConfig} />
+        <div className="border-t border-border pt-3">
+          <Button onClick={save} disabled={saving || !dirty || !proxyConfigValid(draft)}>
+            {saving ? t('common.saving') : t('common.save')}
+          </Button>
+        </div>
+      </CardContent>
+
+      <Dialog
+        open={blocker.state === 'blocked'}
+        onOpenChange={(open) => {
+          if (!open) blocker.reset?.()
+        }}
+      >
+        <DialogContent showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>{t('settings.unsaved_title')}</DialogTitle>
+            <DialogDescription>{t('settings.unsaved_desc')}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="bg-transparent p-0 border-0 mx-0 mb-0">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => blocker.reset?.()}
+              disabled={saving}
+            >
+              {t('common.stay')}
+            </Button>
+            <Button variant="destructive" size="sm" onClick={discardAndLeave} disabled={saving}>
+              {t('common.discard')}
+            </Button>
+            <Button size="sm" onClick={saveAndLeave} disabled={saving}>
+              {saving ? t('common.saving') : t('settings.save_and_leave')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </Card>
   )
 }
 

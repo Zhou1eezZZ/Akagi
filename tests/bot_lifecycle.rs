@@ -20,14 +20,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use akagi::bot::{BotManager, BotRegistry, PythonRuntime};
+use akagi::config::AppConfig;
 use akagi::event_bus::{bot_response_bus, bot_status_bus, notify_bus};
 use akagi::inspector::InspectorWriter;
 use akagi::schema::{BotStatus, LoadStage, MjaiEvent, NotifyLevel};
 use tempfile::TempDir;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 fn fresh_syncs() -> Arc<Mutex<HashSet<String>>> {
     Arc::new(Mutex::new(HashSet::new()))
+}
+
+/// Shared config handle with a 4p active bot, as the supervisor hands the
+/// manager. The active-bot name is read from this at each `start_game`.
+fn cfg_with(active_4p: &str) -> Arc<RwLock<AppConfig>> {
+    let mut c = AppConfig::default();
+    c.bot.active_4p = active_4p.to_string();
+    c.bot.active_3p = String::new();
+    Arc::new(RwLock::new(c))
 }
 
 fn dummy_inspector() -> InspectorWriter {
@@ -109,10 +119,9 @@ async fn loading_emits_syncing_then_spawning_then_ready() {
     let mut notify_rx = notify.subscribe();
 
     let mut mgr = BotManager::new(
-        runtime,
+        Some(runtime),
         registry_root.path().to_path_buf(),
-        "echo".into(),
-        String::new(),
+        cfg_with("echo"),
         response_bus,
         status_bus,
         notify,
@@ -131,6 +140,7 @@ async fn loading_emits_syncing_then_spawning_then_ready() {
             aka_flag: None,
             id: Some(0),
             num_players: 4,
+            game_meta: None,
         }),
     )
     .await
@@ -201,10 +211,9 @@ async fn second_spawn_skips_uv_sync_via_stamp() {
         let status_bus = bot_status_bus();
         let notify = notify_bus();
         let mut mgr = BotManager::new(
-            runtime.clone(),
+            Some(runtime.clone()),
             registry_root.path().to_path_buf(),
-            "echo".into(),
-            String::new(),
+            cfg_with("echo"),
             response_bus,
             status_bus,
             notify,
@@ -219,6 +228,7 @@ async fn second_spawn_skips_uv_sync_via_stamp() {
                 aka_flag: None,
                 id: Some(0),
                 num_players: 4,
+                game_meta: None,
             }),
         )
         .await
@@ -233,10 +243,9 @@ async fn second_spawn_skips_uv_sync_via_stamp() {
     let notify = notify_bus();
     let mut status_rx = status_bus.subscribe();
     let mut mgr = BotManager::new(
-        runtime,
+        Some(runtime),
         registry_root.path().to_path_buf(),
-        "echo".into(),
-        String::new(),
+        cfg_with("echo"),
         response_bus,
         status_bus,
         notify,
@@ -253,6 +262,7 @@ async fn second_spawn_skips_uv_sync_via_stamp() {
             aka_flag: None,
             id: Some(2),
             num_players: 4,
+            game_meta: None,
         }),
     )
     .await

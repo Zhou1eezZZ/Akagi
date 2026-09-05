@@ -38,15 +38,139 @@ bridge to them.
   forwarded onto the `NotifyBus` (→ `notify` Tauri event → bottom-right
   toast); every other line is logged as before, and a malformed payload
   after the prefix is dropped with a `warn!`.
-- `manager` — `BotManager`: subscribes to the `MjaiBus`, accumulates
-  events between decision points (own tsumo / others' dahai-or-kakan /
-  reach_accepted / hora / ryukyoku / end_kyoku / end_game), flushes the
-  pending batch through the `BotRunner`, and broadcasts every
-  `BotResponse` (including `MjaiEvent::None`) on the `BotResponseBus`.
+- `manager` — `BotManager`: subscribes to the **post-tracker bus**,
+  accumulates events between decision points, flushes the pending batch
+  through the `BotRunner`, and broadcasts every `BotResponse` (including
+  `MjaiEvent::None`) on the `BotResponseBus`. A decision point is an event
+  whose *shape* could open a decision for our seat (own tsumo / others'
+  dahai-or-kakan / own chi-or-pon) **and** which the riichi engine says
+  our seat can actually act on — see "Deciding what to ask" below. Round
+  and game boundaries (hora / ryukyoku / end_kyoku / end_game) flush
+  regardless: they open no decision, but they are how the bot hears the
+  hand ended, and `end_game` is where the runner is torn down.
   Spawn point is `start_game` carrying the bot's seat in the `id` field
   and the table's `num_players`. The manager picks `active_4p` or
   `active_3p` from `BotConfig` based on `num_players`; an empty slot for
   the matching mode means analysis-only for that game (no runner spawned).
+- `native` — the built-in, in-process bot (no Python, no subprocess).
+  Two reserved names select it: `akagi-native` (4p) / `akagi-native3p`
+  (3p). `NativeBot` always loads the embedded pure-Rust `native_bot` candle
+  model, and re-reads `BotConfig.api` from the shared `AppConfig` at **every
+  decision**: when `is_active()`, the decision is proxied to the remote
+  inference API (see `api`) with the local model kept as a legal-action gate
+  (skip the API when we can't act) and an error/timeout fallback. Re-reading
+  per decision is what lets the user enable cloud inference, fix a mistyped
+  key, or switch models mid-game — a change resets the `Breaker` so the new
+  settings are tried on the very next move. `Breaker` is an exponential-backoff
+  circuit breaker (5s → 120s): after a failed call the API is skipped for the
+  window, so a dead server costs one slow turn per window instead of a request
+  timeout on every decision. `native::build(actor_id, num_players, config,
+  notify_tx)` seeds the session silently; `BotManager::spawn_runner` calls it
+  for the reserved names, bypassing the registry / venv path entirely.
+- `api` — `ApiClient` + free `redeem`/`health`: a `reqwest` wrapper over
+  the remote inference server (`/v3/react`, `/v3/key`, `/v3/models`,
+  `/v3/redeem`, `/healthz`). Auth is a bearer header. `react` carries its own
+  short `REACT_TIMEOUT` because it blocks the bot's turn; everything else uses
+  the client-wide `REQUEST_TIMEOUT`. Building an `ApiClient` builds a fresh
+  connection pool, so hold one and reuse it. Consumed by `NativeBot` and by the
+  `native_api_*` IPC commands (redeem a code, check a key, list models).
+  Also wraps the whole-game review surface behind the Review page:
+  `submit_review` (gzipped `POST /v3/review`, its own generous
+  `REVIEW_SUBMIT_TIMEOUT` — the server replays the full game at submit),
+  `review_status` (job poll; meta-only — result bodies are served solely
+  through the share URL), `review_share` (issue/re-issue the public link),
+  `shares` (list) and `revoke_share`. Ids interpolated into URL paths are
+  validated to ASCII alphanumerics first. The submit IPC command
+  (`native_api_review_history_game`) loads the recorded history log in Rust
+  and shapes it with `native::build_api_events`, so `/v3/review` sees the
+  identical censored perspective `/v3/react` does and the whole-game log
+  never round-trips through the webview.
+- `purchase` — the unauthenticated payment handshakes used by the in-app "Buy
+  key" flow, one per provider. PayPal: `create_order` / `create_subscription`
+  return an `approve_url` plus a `claim_secret`, and `order_result` /
+  `subscription_result` poll with that secret until the server hands back a
+  key. Creem (merchant of record): `create_checkout` serves both product kinds
+  through one endpoint and `checkout_result` is the single poll — its payload
+  reuses `OrderResult` (a subscription resolves to `key` with `days: 0`).
+  `create_order` / `create_checkout` take a `redeem` flag: with `true` the
+  server redeems the prepaid code into a key itself, so the poll — and the
+  buyer's backup email — carry the key rather than a one-time code the app has
+  already spent. Pass `false` only to renew an existing key, the one case that
+  needs the raw code, since `renew_key` exists only on `/v3/redeem`; the
+  caller branches on whichever of `OrderResult`'s `key` / `code` is set, not
+  on the flag it sent, so an older server that ignores `redeem` still degrades
+  to the classic flow. (On the Creem create, `redeem: false` is omitted from
+  the wire entirely — the endpoint is shared with subscriptions, where an
+  unexpected field risks a `400`.) Prices are server-owned — only the product
+  id crosses the wire, and no client secret is embedded in the binary.
+  Stateless like `api`; the polling state machine lives in the frontend's
+  purchase store, driven through the `native_api_*` IPC commands.
+- `supervisor` — `run_bot_manager`: constructs the `BotManager` and drives
+  its run loop off the `PostTrackerBus`. Tolerates a missing Python runtime
+  — the built-in `native` bots need none.
+- `test_http` (test-only) — a tiny scripted HTTP mock shared by the `api`,
+  `purchase` and `native` tests, so they can assert on the raw request
+  (path, `Authorization` header, body) and script the response.
+
+## Deciding what to ask
+
+A bot is fed every event and answers every event, so its replies cannot say
+which ones it was *asked*: an mjai `none` is the same three bytes for "I
+weighed this call and decline it" and "this was never mine to answer". The
+distinction matters to anything that acts on replies — autoplay pressed a
+pass button for a filler `none` once, and the real `hora` behind it arrived
+to find its decision window already spent.
+
+The riichi engine knows the difference, so `BotManager` asks it rather than
+the bot. `GameTracker` computes `can_act` for our seat the instant it applies
+an event and ships it with that event on the `PostTrackerBus`
+(`event_bus::TrackedEvent`); the manager gates the flush on it.
+
+Computing it *there* is the point. One server frame can carry several seats'
+actions, and the tracker digests all of them in microseconds while the
+manager is still waiting on inference for the first — so a manager that
+looked the answer up on arrival would be asking about a state several events
+old. Riding along with the event is what makes the answer belong to it.
+
+`can_act` is `None` when the engine has no opinion — no game in progress, no
+seat tagged (observer / replay). That is not "cannot act": the manager falls
+back to the event shape alone, so a stream the tracker cannot follow costs
+wasted round-trips rather than a silent bot.
+
+The rule the engine applies is the same one `native::is_decision_point` uses
+on its own candidate set: a legal set that is empty, or that holds nothing
+but `Pass`, is not a decision (riichienv hands a `Pass` to every seat while
+it is in its response phase, including the seats with nothing to claim).
+
+## The `meta.show` card (built-in bot)
+
+The built-in bot attaches a `meta.show` card — the ranked candidates with their
+policy probabilities — to its `BotResponse`. The frontend renders it in the Bot
+Show tile and the suggestion overlay. One rule governs it, and everything in
+`native.rs` that touches `meta` exists to keep it true:
+
+> **The card changes exactly when the bot chose something, and never otherwise.**
+
+Both halves matter, and getting either wrong is invisible in tests but obvious in
+a game.
+
+*Never otherwise*: most events reaching the bot are not decisions — an opponent's
+discard we cannot call, a draw that isn't ours. Those reply `MjaiEvent::None` with
+`meta: None`, and the frontend leaves the card up. If they carried a card, the tile
+would flicker through the whole hand.
+
+*Exactly when it chose*: **declining a call is a choice**, and it must refresh the
+card. `is_decision_point` is the gate — a legal set that is empty, or that contains
+nothing but `Pass`, is not a decision. Anything else is, including a call window
+where the bot passes, and there the pass is ranked as a row of its own against the
+pon/chi/kan it turned down ("Pass 87% / Pon 13%"). That comparison is the most
+useful thing on screen at that moment.
+
+This was got wrong once (#190): the local path suppressed the card whenever the
+top candidate was a pass, so declining a call left the *previous turn's* discard
+advice on screen, reading as live advice for a decision that was already over. The
+cloud-inference path had it right. Both now share the `PASS_LABEL` row, so the card
+reads the same whichever one answered.
 
 ## Adding a new bot
 
